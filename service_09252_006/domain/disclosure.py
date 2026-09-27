@@ -6,7 +6,10 @@
   质量权威机构、审计可见；本机构普通提交人不可见；
 - 任何外机构用户一律不可见（审计除外，审计可跨机构只读）；
 - 评审人若其请求已被取消（重新分配给他人），从取消时刻起失去该包
-  敏感材料的访问权（权限变化即时生效）。
+  敏感材料的访问权（权限变化即时生效）；
+- 评审人对某案件存在【未解除的利益冲突申报】时，对该包的一切可见性
+  都被收回（含非敏感条目与内容下载），等同于不能读取该案件；冲突由
+  管理员填写理由解除后方恢复。
 """
 from __future__ import annotations
 
@@ -15,11 +18,14 @@ from .models import PackageEntry, ReviewPackage, User
 
 
 class DisclosureContext:
-    """一次访问的权限上下文：用户当前有效的评审分配。
+    """一次访问的权限上下文。
 
     active_request_package_ids: 该用户作为评审人、状态仍为
     pending/accepted/completed（即未 cancelled/declined）的请求所在包。
     declined 也不应保留访问权——评审人拒绝后即与该包无关。
+
+    blocked_package_ids: 该用户存在 open 利益冲突申报的包；这些包对其
+    完全不可见（连非敏感内容也不行），视图层会直接拒绝打开案件。
     """
 
     ACTIVE_STATUSES = frozenset(
@@ -30,9 +36,19 @@ class DisclosureContext:
         }
     )
 
-    def __init__(self, user: User, active_request_package_ids: set[str]) -> None:
+    def __init__(
+        self,
+        user: User,
+        active_request_package_ids: set[str],
+        blocked_package_ids: set[str] | None = None,
+    ) -> None:
         self.user = user
         self.active_package_ids = active_request_package_ids
+        self.blocked_package_ids = blocked_package_ids or set()
+
+    def is_case_blocked(self, package_id: str) -> bool:
+        """存在未解除利益冲突：该评审人对此案件完全失权。"""
+        return package_id in self.blocked_package_ids
 
     def can_see_entry(
         self,
@@ -50,6 +66,10 @@ class DisclosureContext:
         # 全局只读角色
         if is_auditor or is_authority:
             return True
+
+        # 利益冲突未解除：对该评审人遮蔽该包全部条目（视图层应直接拒绝）
+        if user.has_role(Role.REVIEWER) and self.is_case_blocked(entry.package_id):
+            return False
 
         is_sensitive = entry.sensitivity == Sensitivity.SENSITIVE.value
 

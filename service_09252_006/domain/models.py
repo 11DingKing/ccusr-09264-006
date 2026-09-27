@@ -136,6 +136,28 @@ class Blob:
 
 
 @dataclass
+class ReviewerConflict:
+    """评审人利益冲突申报（秘书处在分派前核对）。
+
+    只要存在 status=open 的申报：分派接口拒绝该评审人，且该评审人对该
+    评审包的可见范围立即收回到零（连案件本身都不能读取）；管理员或权威
+    机构必须填写理由将其解除（resolved）后，分派与可见性才恢复。
+    """
+
+    conflict_id: str
+    package_id: str
+    institution_id: str
+    reviewer_id: str
+    status: str                    # ConflictStatus
+    reason: str                    # 申报理由（必填）
+    declared_by: str
+    created_at: str
+    resolved_by: Optional[str] = None
+    resolved_at: Optional[str] = None
+    resolution_note: Optional[str] = None  # 解除理由（管理员操作必填）
+
+
+@dataclass
 class AuditEntry:
     audit_id: str
     package_id: Optional[str]

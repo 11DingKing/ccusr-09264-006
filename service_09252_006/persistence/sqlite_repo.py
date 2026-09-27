@@ -23,11 +23,12 @@ from ..domain.models import (
     Objection,
     PackageEntry,
     ReviewPackage,
+    ReviewerConflict,
     ReviewRequest,
     User,
 )
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 class SqliteRepository(Repository):
@@ -154,6 +155,24 @@ class SqliteRepository(Repository):
                     created_at    TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS reviewer_conflicts (
+                    conflict_id    TEXT PRIMARY KEY,
+                    package_id     TEXT NOT NULL REFERENCES packages(package_id),
+                    institution_id TEXT NOT NULL,
+                    reviewer_id    TEXT NOT NULL,
+                    status         TEXT NOT NULL,
+                    reason         TEXT NOT NULL,
+                    declared_by    TEXT NOT NULL,
+                    created_at     TEXT NOT NULL,
+                    resolved_by    TEXT,
+                    resolved_at    TEXT,
+                    resolution_note TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_conflicts_reviewer
+                    ON reviewer_conflicts(reviewer_id, status);
+                CREATE INDEX IF NOT EXISTS idx_conflicts_package
+                    ON reviewer_conflicts(package_id);
+
                 CREATE TABLE IF NOT EXISTS audit_log (
                     audit_id       TEXT PRIMARY KEY,
                     package_id     TEXT,
@@ -176,7 +195,7 @@ class SqliteRepository(Repository):
                     created_at  TEXT NOT NULL
                 );
 
-                PRAGMA user_version = 1;
+                PRAGMA user_version = 2;
             """
         )
 
@@ -625,6 +644,97 @@ class SqliteRepository(Repository):
             )
             for r in rows
         ]
+
+    # ----------------------------------------------------------- COI 冲突事件
+    def insert_conflict(self, conflict: ReviewerConflict) -> None:
+        self._conn.execute(
+            "INSERT INTO reviewer_conflicts(conflict_id, package_id, institution_id,"
+            " reviewer_id, status, reason, declared_by, created_at, resolved_by,"
+            " resolved_at, resolution_note)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                conflict.conflict_id,
+                conflict.package_id,
+                conflict.institution_id,
+                conflict.reviewer_id,
+                conflict.status,
+                conflict.reason,
+                conflict.declared_by,
+                conflict.created_at,
+                conflict.resolved_by,
+                conflict.resolved_at,
+                conflict.resolution_note,
+            ),
+        )
+
+    def _row_to_conflict(self, row: sqlite3.Row) -> ReviewerConflict:
+        return ReviewerConflict(
+            conflict_id=row["conflict_id"],
+            package_id=row["package_id"],
+            institution_id=row["institution_id"],
+            reviewer_id=row["reviewer_id"],
+            status=row["status"],
+            reason=row["reason"],
+            declared_by=row["declared_by"],
+            created_at=row["created_at"],
+            resolved_by=row["resolved_by"],
+            resolved_at=row["resolved_at"],
+            resolution_note=row["resolution_note"],
+        )
+
+    def get_open_conflict(
+        self, package_id: str, reviewer_id: str
+    ) -> ReviewerConflict | None:
+        row = self._conn.execute(
+            "SELECT * FROM reviewer_conflicts WHERE package_id = ?"
+            " AND reviewer_id = ? AND status = 'open' LIMIT 1",
+            (package_id, reviewer_id),
+        ).fetchone()
+        return None if row is None else self._row_to_conflict(row)
+
+    def list_conflicts(
+        self,
+        package_id: str | None = None,
+        reviewer_id: str | None = None,
+    ) -> list[ReviewerConflict]:
+        where = []
+        params: list = []
+        if package_id is not None:
+            where.append("package_id = ?")
+            params.append(package_id)
+        if reviewer_id is not None:
+            where.append("reviewer_id = ?")
+            params.append(reviewer_id)
+        clause = (" WHERE " + " AND ".join(where)) if where else ""
+        rows = self._conn.execute(
+            f"SELECT * FROM reviewer_conflicts{clause} ORDER BY created_at",
+            params,
+        ).fetchall()
+        return [self._row_to_conflict(r) for r in rows]
+
+    def resolve_conflict(
+        self,
+        conflict_id: str,
+        *,
+        resolved_by: str,
+        resolved_at: str,
+        resolution_note: str,
+    ) -> bool:
+        cur = self._conn.execute(
+            "UPDATE reviewer_conflicts SET status = 'resolved', resolved_by = ?,"
+            " resolved_at = ?, resolution_note = ?"
+            " WHERE conflict_id = ? AND status = 'open'",
+            (resolved_by, resolved_at, resolution_note, conflict_id),
+        )
+        return cur.rowcount == 1
+
+    def list_open_conflict_package_ids(self, reviewer_id: str) -> set[str]:
+        rows = self._conn.execute(
+            "SELECT DISTINCT package_id FROM reviewer_conflicts"
+            " WHERE reviewer_id = ? AND status = 'open'",
+            (reviewer_id,),
+        ).fetchall()
+        return {r["package_id"] for r in rows}
 
     # ------------------------------------------------------------------ audit
     def insert_audit(self, entry: AuditEntry) -> None:

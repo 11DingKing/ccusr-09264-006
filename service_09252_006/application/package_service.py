@@ -245,11 +245,15 @@ class PackageService(Service):
 
         曾被分配到该包的评审人（即使请求已取消/拒绝）可打开视图看到
         非敏感条目与“存在敏感条目”的事实，但敏感内容按当前有效分配遮蔽；
-        与该包毫无关系的外部机构用户直接拒绝。
+        与该包毫无关系的外部机构用户直接拒绝。存在【未解除利益冲突申报】
+        的评审人连案件本身都不能打开（可见范围收回到零）。
         """
         package = self.repo.get_package(package_id)
         if package is None:
             raise NotFoundError("评审包不存在")
+        # 利益冲突拦截优先于一切：申报后原评审人不能再读取该案件
+        if self.repo.get_open_conflict(package_id, actor.user_id) is not None:
+            raise PermissionDeniedError("存在未解除的利益冲突，不能读取该案件")
         is_assigned = (
             actor.has_role(Role.REVIEWER)
             and any(
@@ -269,7 +273,8 @@ class PackageService(Service):
             r.package_id
             for r in self.repo.list_active_requests_by_reviewer(actor.user_id)
         }
-        ctx = DisclosureContext(actor, active)
+        blocked = self.repo.list_open_conflict_package_ids(actor.user_id)
+        ctx = DisclosureContext(actor, active, blocked)
 
         visible_entries = []
         hidden_count = 0
@@ -296,6 +301,9 @@ class PackageService(Service):
         package = self.repo.get_package(package_id)
         if package is None:
             raise NotFoundError("评审包不存在")
+        # 利益冲突未解除：该评审人对案件的任何内容都无下载权
+        if self.repo.get_open_conflict(package_id, actor.user_id) is not None:
+            raise PermissionDeniedError("存在未解除的利益冲突，不能读取该案件")
         entry = next(
             (e for e in package.entries if e.version_id == version_id), None
         )
@@ -305,7 +313,8 @@ class PackageService(Service):
             r.package_id
             for r in self.repo.list_active_requests_by_reviewer(actor.user_id)
         }
-        ctx = DisclosureContext(actor, active)
+        blocked = self.repo.list_open_conflict_package_ids(actor.user_id)
+        ctx = DisclosureContext(actor, active, blocked)
         if not ctx.can_see_entry(entry, package):
             raise PermissionDeniedError("无权下载该材料（最小披露限制）")
         version = self.repo.get_version(version_id)

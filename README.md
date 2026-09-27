@@ -37,6 +37,18 @@
   失权；角色调整在下次请求鉴权时即时生效。
 - 无权限者看到的清单条目不返回摘要（避免内容指纹本身泄露）。
 
+### 评审人利益冲突（分派前拦截）
+- 秘书处在分派前核对并申报（`POST /v1/packages/{id}/conflicts`，必填
+  理由）；申报是追加式 **SQLite 事件**（`reviewer_conflicts` 表），
+  解除不删除历史。
+- 存在未解除（open）冲突时：Python 分派接口直接拒绝该评审人
+  （`409 conflict`）；原评审人对该案件的**可见范围收回到零**——包视图、
+  内容下载（敏感与非敏感均拦）、分配列表、接受/异议/结论全部 403。
+- 只有管理员/质量权威机构填写**解除理由**
+  （`POST /v1/conflicts/{id}/resolve`）后事件置为 resolved，分派与可见性
+  才恢复；解除后再次申报会追加新的 open 事件。操作人、理由与时刻全部
+  落库并写入审计日志。
+
 ### 并发、幂等与恢复
 - 所有写用例在 `BEGIN IMMEDIATE` 事务内执行；状态推进使用条件 UPDATE
   （`WHERE status = expected`），并发分配/签发下只有一方推进，另一方回放，
@@ -100,6 +112,9 @@ python3 -m service_09252_006.cli verify --db ./data/qe.db [--json]
 | GET  | `/v1/packages/{id}` | 包视图（敏感条目按权限遮蔽） |
 | GET  | `/v1/packages/{id}/entries/{vid}/content` | 授权下载内容字节 |
 | POST | `/v1/packages/{id}/assignments` | 分配评审（可带跨时区截止） |
+| POST | `/v1/packages/{id}/conflicts` | 申报评审人利益冲突（分派前拦截） |
+| GET  | `/v1/packages/{id}/conflicts` | 冲突申报列表 |
+| POST | `/v1/conflicts/{id}/resolve` | 管理员填写理由解除冲突 |
 | GET  | `/v1/packages/{id}/requests` | 分配情况 |
 | POST | `/v1/requests/{id}/respond` | 评审人接受/拒绝 |
 | POST | `/v1/requests/{id}/objections` | 登记异议 |
@@ -119,6 +134,8 @@ python3 -m compileall -q service_09252_006 tests
 
 覆盖：内容寻址与版本链、封存不变量、**材料撤回**（封存前后）、后补材料
 只能复审、**最小披露与权限变化**（取消/拒绝/角色调整/跨机构）、
+**评审人利益冲突**（分派前拦截、申报即失权、管理员解除必须留理由、
+解除后恢复）、
 **跨时区截止**（上海/伦敦/洛杉矶）、异议与签发约束、幂等重放与失败重试、
 多连接**并发复审**、离线核验对字节/清单/评审篡改的检出，以及完整 HTTP
 端到端流程。

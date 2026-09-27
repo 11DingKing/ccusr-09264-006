@@ -49,3 +49,8 @@ class Decision(str, Enum):
     APPROVED = "approved"
     NEEDS_REVISION = "needs_revision"
     REJECTED = "rejected"
+
+
+class ConflictStatus(str, Enum):
+    OPEN = "open"          # 已申报未解除：分派前拦截，评审人对该案件立即失权
+    RESOLVED = "resolved"  # 管理员/权威机构填写理由后解除，恢复分派与可见性

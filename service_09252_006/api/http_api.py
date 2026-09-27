@@ -394,6 +394,43 @@ class ApiHandler(BaseHTTPRequestHandler):
             ),
         )
 
+    # -------------------------------------------------------- 利益冲突
+    def declare_conflict(self, package_id: str) -> None:
+        actor = self._actor()
+        body = self._read_json()
+        result = self.services.reviews.declare_conflict(
+            actor,
+            package_id=package_id,
+            reviewer_id=body["reviewer_id"],
+            reason=body["reason"],
+            idempotency_key=self._idempotency_key(),
+        )
+        self._send_json(201, result)
+
+    def list_conflicts(self, package_id: str) -> None:
+        actor = self._actor()
+        self._send_json(
+            200,
+            {
+                "conflicts": self.services.reviews.list_conflicts(
+                    actor, package_id=package_id
+                )
+            },
+        )
+
+    def resolve_conflict(self, conflict_id: str) -> None:
+        actor = self._actor()
+        body = self._read_json()
+        self._send_json(
+            200,
+            self.services.reviews.resolve_conflict(
+                actor,
+                conflict_id=conflict_id,
+                resolution_note=body["resolution_note"],
+                idempotency_key=self._idempotency_key(),
+            ),
+        )
+
 
 # 路由表：方法 -> [(路径模式, 处理方法名)]
 def _routes() -> dict[str, list[tuple[str, str]]]:
@@ -409,6 +446,8 @@ def _routes() -> dict[str, list[tuple[str, str]]]:
         ("/v1/packages/{package_id}/seal", "seal_package"),
         ("/v1/packages/{package_id}/assignments", "assign"),
         ("/v1/packages/{package_id}/decision", "issue_decision"),
+        ("/v1/packages/{package_id}/conflicts", "declare_conflict"),
+        ("/v1/conflicts/{conflict_id}/resolve", "resolve_conflict"),
         ("/v1/requests/{request_id}/cancel", "cancel_request"),
         ("/v1/requests/{request_id}/respond", "respond_request"),
         ("/v1/requests/{request_id}/objections", "create_objection"),
@@ -420,6 +459,7 @@ def _routes() -> dict[str, list[tuple[str, str]]]:
         ("/v1/packages", "list_packages"),
         ("/v1/packages/{package_id}", "get_package"),
         ("/v1/packages/{package_id}/requests", "list_requests"),
+        ("/v1/packages/{package_id}/conflicts", "list_conflicts"),
         (
             "/v1/packages/{package_id}/entries/{version_id}/content",
             "download_entry",

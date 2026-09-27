@@ -25,7 +25,7 @@ from ..domain.errors import (
     ValidationError,
 )
 from ..domain.fingerprint import review_record_fingerprint
-from ..domain.models import Objection, ReviewRequest, User
+from ..domain.models import Objection, ReviewRequest, ReviewerConflict, User
 from ..application.timeutil import now_is_past, resolve_deadline
 from .base import Service, require_roles
 
@@ -67,6 +67,18 @@ class ReviewService(Service):
                 raise ValidationError("被分配人不是评审人", details={"reviewer_id": reviewer_id})
             if reviewer.institution_id == package.institution_id:
                 raise ValidationError("评审人必须独立于送审机构")
+
+            # 分派前最后一道拦截：存在未解除利益冲突的评审人一律拒绝
+            conflict = self.repo.get_open_conflict(package_id, reviewer_id)
+            if conflict is not None:
+                raise ConflictError(
+                    "该评审人对本案件存在未解除的利益冲突，不能分派",
+                    details={
+                        "reviewer_id": reviewer_id,
+                        "conflict_id": conflict.conflict_id,
+                        "reason": conflict.reason,
+                    },
+                )
 
             # 同一评审人已有有效请求：幂等回放
             for req in self.repo.list_requests_by_package(package_id):
@@ -162,7 +174,154 @@ class ReviewService(Service):
 
         return self.idempotent(idempotency_key, work)
 
-    # ------------------------------------------------------------- 响应
+    # --------------------------------------------------------- 利益冲突
+    def declare_conflict(
+        self,
+        actor: User,
+        *,
+        package_id: str,
+        reviewer_id: str,
+        reason: str,
+        idempotency_key: str | None = None,
+    ) -> dict:
+        """秘书处在分派前登记评审人利益冲突。
+
+        申报是追加事件（不删除历史）；一旦存在 open 申报，该评审人：
+        - 不能被分派到本案件（assign_reviewer 拦截）；
+        - 立即失去对本案件的读取权（包视图/内容下载均拒绝）。
+        管理员/权威机构需填写理由解除后才恢复。
+        """
+        require_roles(
+            actor,
+            Role.QUALITY_AUTHORITY,
+            Role.INSTITUTION_ADMIN,
+        )
+        if not reason or not reason.strip():
+            raise ValidationError("利益冲突申报理由不能为空")
+
+        def work() -> dict:
+            package = self.repo.get_package(package_id)
+            if package is None:
+                raise NotFoundError("评审包不存在")
+            if (
+                not actor.has_role(Role.QUALITY_AUTHORITY)
+                and package.institution_id != actor.institution_id
+            ):
+                raise PermissionDeniedError("只能登记本机构评审包的利益冲突")
+            reviewer = self.repo.get_user(reviewer_id)
+            if reviewer is None or not reviewer.has_role(Role.REVIEWER):
+                raise ValidationError(
+                    "被申报人不是评审人", details={"reviewer_id": reviewer_id}
+                )
+
+            existing = self.repo.get_open_conflict(package_id, reviewer_id)
+            if existing is not None:
+                return self._conflict_dict(existing, replayed=True)
+
+            conflict = ReviewerConflict(
+                conflict_id=self.ids.new_id("coi"),
+                package_id=package_id,
+                institution_id=package.institution_id,
+                reviewer_id=reviewer_id,
+                status="open",
+                reason=reason.strip(),
+                declared_by=actor.user_id,
+                created_at=self.clock.now_iso(),
+            )
+            self.repo.insert_conflict(conflict)
+            self.audit(
+                actor.user_id, "review.conflict_declared",
+                package_id=package_id, institution_id=package.institution_id,
+                detail={
+                    "conflict_id": conflict.conflict_id,
+                    "reviewer_id": reviewer_id,
+                    "reason": conflict.reason,
+                },
+            )
+            return self._conflict_dict(conflict)
+
+        return self.idempotent(idempotency_key, work)
+
+    def resolve_conflict(
+        self,
+        actor: User,
+        *,
+        conflict_id: str,
+        resolution_note: str,
+        idempotency_key: str | None = None,
+    ) -> dict:
+        """管理员/权威机构解除利益冲突。解除操作必须留下理由。"""
+        require_roles(actor, Role.QUALITY_AUTHORITY, Role.INSTITUTION_ADMIN)
+        if not resolution_note or not resolution_note.strip():
+            raise ValidationError("解除利益冲突必须填写理由")
+
+        def work() -> dict:
+            conflicts = self.repo.list_conflicts()
+            current = next((c for c in conflicts if c.conflict_id == conflict_id), None)
+            if current is None:
+                raise NotFoundError("利益冲突申报不存在")
+            if (
+                not actor.has_role(Role.QUALITY_AUTHORITY)
+                and current.institution_id != actor.institution_id
+            ):
+                raise PermissionDeniedError("只能解除本机构评审包的利益冲突")
+            if current.status == "resolved":
+                return self._conflict_dict(current, replayed=True)
+
+            resolved_at = self.clock.now_iso()
+            moved = self.repo.resolve_conflict(
+                conflict_id,
+                resolved_by=actor.user_id,
+                resolved_at=resolved_at,
+                resolution_note=resolution_note.strip(),
+            )
+            if not moved:
+                # 并发下已被另一事务解除：回放最新状态
+                fresh = next(
+                    (c for c in self.repo.list_conflicts() if c.conflict_id == conflict_id),
+                    None,
+                )
+                if fresh is not None and fresh.status == "resolved":
+                    return self._conflict_dict(fresh, replayed=True)
+                raise ConflictError("利益冲突状态已被其他操作改变，请重试")
+
+            resolved = next(
+                c for c in self.repo.list_conflicts() if c.conflict_id == conflict_id
+            )
+            self.audit(
+                actor.user_id, "review.conflict_resolved",
+                package_id=resolved.package_id, institution_id=resolved.institution_id,
+                detail={
+                    "conflict_id": conflict_id,
+                    "reviewer_id": resolved.reviewer_id,
+                    "resolution_note": resolved.resolution_note,
+                },
+            )
+            return self._conflict_dict(resolved)
+
+        return self.idempotent(idempotency_key, work)
+
+    def list_conflicts(
+        self,
+        actor: User,
+        *,
+        package_id: str | None = None,
+    ) -> list[dict]:
+        """列出冲突申报。机构管理员限本机构；权威机构/审计可查全部。"""
+        if not (
+            actor.has_role(Role.QUALITY_AUTHORITY)
+            or actor.has_role(Role.INSTITUTION_ADMIN)
+            or actor.has_role(Role.AUDITOR)
+        ):
+            raise PermissionDeniedError("当前角色无权查看利益冲突申报")
+        items = self.repo.list_conflicts(package_id=package_id)
+        if not actor.has_role(Role.QUALITY_AUTHORITY) and not actor.has_role(
+            Role.AUDITOR
+        ):
+            items = [c for c in items if c.institution_id == actor.institution_id]
+        return [self._conflict_dict(c) for c in items]
+
+
     def respond_assignment(
         self,
         actor: User,
@@ -403,6 +562,9 @@ class ReviewService(Service):
         package = self.repo.get_package(package_id)
         if package is None:
             raise NotFoundError("评审包不存在")
+        # 有未解除冲突的评审人视同与案件无关，不能读取分配信息
+        if self.repo.get_open_conflict(package_id, actor.user_id) is not None:
+            raise PermissionDeniedError("存在未解除的利益冲突，不能读取该案件")
         if (
             actor.institution_id != package.institution_id
             and not actor.has_role(Role.QUALITY_AUTHORITY)
@@ -431,6 +593,11 @@ class ReviewService(Service):
             raise NotFoundError("评审请求不存在")
         if req.reviewer_id != actor.user_id:
             raise PermissionDeniedError("这不是分配给当前评审人的请求")
+        if self.repo.get_open_conflict(req.package_id, actor.user_id) is not None:
+            raise PermissionDeniedError(
+                "存在未解除的利益冲突，不能继续处理该案件",
+                details={"request_id": request_id, "package_id": req.package_id},
+            )
         return req
 
     def _check_deadline(self, req: ReviewRequest) -> None:
@@ -447,8 +614,24 @@ class ReviewService(Service):
             )
 
     @staticmethod
-    def _request_dict(r: ReviewRequest, *, replayed: bool = False) -> dict:
+    def _conflict_dict(c: ReviewerConflict, *, replayed: bool = False) -> dict:
         return {
+            "conflict_id": c.conflict_id,
+            "package_id": c.package_id,
+            "institution_id": c.institution_id,
+            "reviewer_id": c.reviewer_id,
+            "status": c.status,
+            "reason": c.reason,
+            "declared_by": c.declared_by,
+            "created_at": c.created_at,
+            "resolved_by": c.resolved_by,
+            "resolved_at": c.resolved_at,
+            "resolution_note": c.resolution_note,
+            "replayed": replayed,
+        }
+
+    @staticmethod
+    def _request_dict(r: ReviewRequest, *, replayed: bool = False) -> dict:        return {
             "request_id": r.request_id,
             "package_id": r.package_id,
             "reviewer_id": r.reviewer_id,

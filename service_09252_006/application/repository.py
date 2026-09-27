@@ -18,6 +18,7 @@ from ..domain.models import (
     PackageEntry,
     ReviewPackage,
     ReviewRequest,
+    ReviewerConflict,
     User,
 )
 
@@ -139,6 +140,38 @@ class Repository(abc.ABC):
 
     @abc.abstractmethod
     def list_objections_by_package(self, package_id: str) -> list[Objection]: ...
+
+    # ---- 评审人利益冲突 ----
+    @abc.abstractmethod
+    def insert_conflict(self, conflict: ReviewerConflict) -> None: ...
+
+    @abc.abstractmethod
+    def get_open_conflict(
+        self, package_id: str, reviewer_id: str
+    ) -> ReviewerConflict | None:
+        """返回该评审人对该包当前未解除（open）的冲突申报，无则 None。"""
+
+    @abc.abstractmethod
+    def list_conflicts(
+        self,
+        package_id: str | None = None,
+        reviewer_id: str | None = None,
+    ) -> list[ReviewerConflict]: ...
+
+    @abc.abstractmethod
+    def resolve_conflict(
+        self,
+        conflict_id: str,
+        *,
+        resolved_by: str,
+        resolved_at: str,
+        resolution_note: str,
+    ) -> bool:
+        """条件更新 open -> resolved；不存在或已解除返回 False。"""
+
+    @abc.abstractmethod
+    def list_open_conflict_package_ids(self, reviewer_id: str) -> set[str]:
+        """该评审人存在 open 冲突的包集合（可见范围判定依据）。"""
 
     # ---- 审计 ----
     @abc.abstractmethod
