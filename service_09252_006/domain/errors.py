@@ -51,6 +51,13 @@ class DeadlineExceededError(ConflictError):
     http_status = 409
 
 
+class ReviewerConflictError(ConflictError):
+    """评审人与该案件存在已申报的利益冲突：分派/读取/评审动作一律拦截。"""
+
+    code = "reviewer_conflict"
+    http_status = 409
+
+
 class IntegrityError(DomainError):
     """离线核验或写入时发现指纹不一致（疑似篡改）。"""
 

@@ -49,3 +49,10 @@ class Decision(str, Enum):
     APPROVED = "approved"
     NEEDS_REVISION = "needs_revision"
     REJECTED = "rejected"
+
+
+class ConflictEventType(str, Enum):
+    """评审人利益冲突事件类型（追加式事件流，状态由最新事件推导）。"""
+
+    DECLARED = "declared"  # 申报冲突：评审人对该案件即刻失权、不可再被分派
+    CLEARED = "cleared"    # 解除冲突：追加事件，恢复可见与可分派

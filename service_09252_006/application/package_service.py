@@ -246,10 +246,15 @@ class PackageService(Service):
         曾被分配到该包的评审人（即使请求已取消/拒绝）可打开视图看到
         非敏感条目与“存在敏感条目”的事实，但敏感内容按当前有效分配遮蔽；
         与该包毫无关系的外部机构用户直接拒绝。
+
+        已对本包申报利益冲突（且未解除）的评审人对整个案件失权，直接拒绝，
+        不再返回任何清单信息。
         """
         package = self.repo.get_package(package_id)
         if package is None:
             raise NotFoundError("评审包不存在")
+        if self._is_conflicted_reviewer(actor, package_id):
+            raise PermissionDeniedError("该评审人已申报利益冲突，不能读取本案件")
         is_assigned = (
             actor.has_role(Role.REVIEWER)
             and any(
@@ -269,7 +274,10 @@ class PackageService(Service):
             r.package_id
             for r in self.repo.list_active_requests_by_reviewer(actor.user_id)
         }
-        ctx = DisclosureContext(actor, active)
+        conflicts = set(
+            self.repo.list_active_conflict_package_ids(actor.user_id)
+        )
+        ctx = DisclosureContext(actor, active, conflicts)
 
         visible_entries = []
         hidden_count = 0
@@ -296,6 +304,8 @@ class PackageService(Service):
         package = self.repo.get_package(package_id)
         if package is None:
             raise NotFoundError("评审包不存在")
+        if self._is_conflicted_reviewer(actor, package_id):
+            raise PermissionDeniedError("该评审人已申报利益冲突，不能读取本案件")
         entry = next(
             (e for e in package.entries if e.version_id == version_id), None
         )
@@ -305,7 +315,10 @@ class PackageService(Service):
             r.package_id
             for r in self.repo.list_active_requests_by_reviewer(actor.user_id)
         }
-        ctx = DisclosureContext(actor, active)
+        conflicts = set(
+            self.repo.list_active_conflict_package_ids(actor.user_id)
+        )
+        ctx = DisclosureContext(actor, active, conflicts)
         if not ctx.can_see_entry(entry, package):
             raise PermissionDeniedError("无权下载该材料（最小披露限制）")
         version = self.repo.get_version(version_id)
@@ -326,6 +339,21 @@ class PackageService(Service):
         else:
             packages = self.repo.list_packages(actor.institution_id)
         return [self._package_dict(p) for p in packages]
+
+    def _is_conflicted_reviewer(self, actor: User, package_id: str) -> bool:
+        """该用户是否以评审人身份对该包处于已申报未解除的冲突。
+
+        权威机构/审计的全局只读视角不受影响。
+        """
+        if (
+            actor.has_role(Role.QUALITY_AUTHORITY)
+            or actor.has_role(Role.AUDITOR)
+            or not actor.has_role(Role.REVIEWER)
+        ):
+            return False
+        return package_id in set(
+            self.repo.list_active_conflict_package_ids(actor.user_id)
+        )
 
     @staticmethod
     def _package_dict(p: ReviewPackage, *, replayed: bool = False) -> dict:

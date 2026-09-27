@@ -12,6 +12,7 @@ from contextlib import AbstractContextManager
 from ..domain.models import (
     AuditEntry,
     Blob,
+    ConflictEvent,
     Material,
     MaterialVersion,
     Objection,
@@ -139,6 +140,19 @@ class Repository(abc.ABC):
 
     @abc.abstractmethod
     def list_objections_by_package(self, package_id: str) -> list[Objection]: ...
+
+    # ---- 评审人利益冲突 ----
+    @abc.abstractmethod
+    def insert_conflict_event(self, event: ConflictEvent) -> None: ...
+
+    @abc.abstractmethod
+    def list_conflict_events(
+        self, package_id: str, reviewer_id: str | None = None
+    ) -> list[ConflictEvent]: ...
+
+    @abc.abstractmethod
+    def list_active_conflict_package_ids(self, reviewer_id: str) -> list[str]:
+        """该评审人当前处于“已申报、未解除”冲突的包（最新事件为 declared）。"""
 
     # ---- 审计 ----
     @abc.abstractmethod

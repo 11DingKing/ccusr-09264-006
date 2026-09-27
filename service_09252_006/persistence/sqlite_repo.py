@@ -18,6 +18,7 @@ from ..domain.fingerprint import digest_bytes
 from ..domain.models import (
     AuditEntry,
     Blob,
+    ConflictEvent,
     Material,
     MaterialVersion,
     Objection,
@@ -27,7 +28,25 @@ from ..domain.models import (
     User,
 )
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+
+# v2 新增：评审人利益冲突事件流（追加式；declared/cleared）。
+_CONFLICTS_TABLE_SQL = """
+    CREATE TABLE IF NOT EXISTS reviewer_conflict_events (
+        event_id       TEXT PRIMARY KEY,
+        package_id     TEXT NOT NULL REFERENCES packages(package_id),
+        institution_id TEXT NOT NULL,
+        reviewer_id    TEXT NOT NULL,
+        event_type     TEXT NOT NULL CHECK (event_type IN ('declared','cleared')),
+        reason         TEXT NOT NULL,
+        declared_by    TEXT NOT NULL,
+        created_at     TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_conflicts_reviewer
+        ON reviewer_conflict_events(reviewer_id, package_id, created_at);
+    CREATE INDEX IF NOT EXISTS idx_conflicts_package
+        ON reviewer_conflict_events(package_id);
+"""
 
 
 class SqliteRepository(Repository):
@@ -51,133 +70,139 @@ class SqliteRepository(Repository):
         version = self._conn.execute("PRAGMA user_version").fetchone()[0]
         if version >= SCHEMA_VERSION:
             return
-        # executescript 会自行提交事务；把 user_version 写入放在同一脚本
+        if version == 0:
+            # executescript 会自行提交事务；把 user_version 写入放在同一脚本
+            self._conn.executescript(
+                """
+                    CREATE TABLE IF NOT EXISTS users (
+                        user_id        TEXT PRIMARY KEY,
+                        institution_id TEXT,
+                        roles_json     TEXT NOT NULL,
+                        display_name   TEXT NOT NULL DEFAULT ''
+                    );
+
+                    CREATE TABLE IF NOT EXISTS blobs (
+                        sha256     TEXT PRIMARY KEY,
+                        data       BLOB NOT NULL,
+                        media_type TEXT NOT NULL,
+                        size       INTEGER NOT NULL,
+                        created_at TEXT NOT NULL
+                    );
+
+                    CREATE TABLE IF NOT EXISTS materials (
+                        material_id        TEXT PRIMARY KEY,
+                        institution_id     TEXT NOT NULL,
+                        kind               TEXT NOT NULL,
+                        sensitivity        TEXT NOT NULL,
+                        title              TEXT NOT NULL,
+                        current_version_id TEXT,
+                        withdrawn          INTEGER NOT NULL DEFAULT 0,
+                        created_at         TEXT NOT NULL
+                    );
+
+                    CREATE TABLE IF NOT EXISTS versions (
+                        version_id              TEXT PRIMARY KEY,
+                        material_id             TEXT NOT NULL REFERENCES materials(material_id),
+                        institution_id          TEXT NOT NULL,
+                        sha256                  TEXT NOT NULL,
+                        size                    INTEGER NOT NULL,
+                        media_type              TEXT NOT NULL,
+                        version_no              INTEGER NOT NULL,
+                        supersedes_version_id   TEXT,
+                        created_by              TEXT NOT NULL,
+                        created_at              TEXT NOT NULL,
+                        withdrawn               INTEGER NOT NULL DEFAULT 0,
+                        withdrawn_at            TEXT,
+                        UNIQUE(material_id, version_no)
+                    );
+
+                    CREATE TABLE IF NOT EXISTS packages (
+                        package_id            TEXT PRIMARY KEY,
+                        institution_id        TEXT NOT NULL,
+                        title                 TEXT NOT NULL,
+                        status                TEXT NOT NULL,
+                        created_by            TEXT NOT NULL,
+                        created_at            TEXT NOT NULL,
+                        sealed_at             TEXT,
+                        manifest_fingerprint  TEXT,
+                        decided_at            TEXT,
+                        decision              TEXT,
+                        decision_note         TEXT,
+                        review_fingerprint    TEXT,
+                        supersedes_package_id TEXT
+                    );
+
+                    CREATE TABLE IF NOT EXISTS entries (
+                        entry_id    TEXT PRIMARY KEY,
+                        package_id  TEXT NOT NULL REFERENCES packages(package_id),
+                        material_id TEXT NOT NULL,
+                        version_id  TEXT NOT NULL REFERENCES versions(version_id),
+                        sha256      TEXT NOT NULL,
+                        kind        TEXT NOT NULL,
+                        sensitivity TEXT NOT NULL,
+                        added_at    TEXT NOT NULL,
+                        UNIQUE(package_id, version_id)
+                    );
+
+                    CREATE TABLE IF NOT EXISTS requests (
+                        request_id       TEXT PRIMARY KEY,
+                        package_id       TEXT NOT NULL REFERENCES packages(package_id),
+                        institution_id   TEXT NOT NULL,
+                        reviewer_id      TEXT NOT NULL,
+                        status           TEXT NOT NULL,
+                        assigned_by      TEXT NOT NULL,
+                        assigned_at      TEXT NOT NULL,
+                        responded_at     TEXT,
+                        completed_at     TEXT,
+                        verdict          TEXT,
+                        comment          TEXT,
+                        deadline_at_utc  TEXT,
+                        deadline_timezone TEXT
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_requests_reviewer
+                        ON requests(reviewer_id, status);
+                    CREATE INDEX IF NOT EXISTS idx_requests_package ON requests(package_id);
+
+                    CREATE TABLE IF NOT EXISTS objections (
+                        objection_id  TEXT PRIMARY KEY,
+                        request_id    TEXT NOT NULL REFERENCES requests(request_id),
+                        package_id    TEXT NOT NULL REFERENCES packages(package_id),
+                        institution_id TEXT NOT NULL,
+                        reviewer_id   TEXT NOT NULL,
+                        category      TEXT NOT NULL,
+                        detail        TEXT NOT NULL,
+                        created_at    TEXT NOT NULL
+                    );
+
+                    CREATE TABLE IF NOT EXISTS audit_log (
+                        audit_id       TEXT PRIMARY KEY,
+                        package_id     TEXT,
+                        institution_id TEXT,
+                        actor_id       TEXT NOT NULL,
+                        action         TEXT NOT NULL,
+                        at             TEXT NOT NULL,
+                        detail_json    TEXT NOT NULL DEFAULT '{}'
+                    );
+
+                    CREATE TABLE IF NOT EXISTS idempotency (
+                        idempotency_key TEXT PRIMARY KEY,
+                        result_json     TEXT NOT NULL,
+                        created_at      TEXT NOT NULL
+                    );
+
+                    CREATE TABLE IF NOT EXISTS api_tokens (
+                        token       TEXT PRIMARY KEY,
+                        user_id     TEXT NOT NULL REFERENCES users(user_id),
+                        created_at  TEXT NOT NULL
+                    );
+                """
+                + _CONFLICTS_TABLE_SQL
+                + "PRAGMA user_version = 2;"
+            )
+            return
+        # version == 1：增量迁移到 2（评审人利益冲突事件表）
         self._conn.executescript(
-            """
-                CREATE TABLE IF NOT EXISTS users (
-                    user_id        TEXT PRIMARY KEY,
-                    institution_id TEXT,
-                    roles_json     TEXT NOT NULL,
-                    display_name   TEXT NOT NULL DEFAULT ''
-                );
-
-                CREATE TABLE IF NOT EXISTS blobs (
-                    sha256     TEXT PRIMARY KEY,
-                    data       BLOB NOT NULL,
-                    media_type TEXT NOT NULL,
-                    size       INTEGER NOT NULL,
-                    created_at TEXT NOT NULL
-                );
-
-                CREATE TABLE IF NOT EXISTS materials (
-                    material_id        TEXT PRIMARY KEY,
-                    institution_id     TEXT NOT NULL,
-                    kind               TEXT NOT NULL,
-                    sensitivity        TEXT NOT NULL,
-                    title              TEXT NOT NULL,
-                    current_version_id TEXT,
-                    withdrawn          INTEGER NOT NULL DEFAULT 0,
-                    created_at         TEXT NOT NULL
-                );
-
-                CREATE TABLE IF NOT EXISTS versions (
-                    version_id              TEXT PRIMARY KEY,
-                    material_id             TEXT NOT NULL REFERENCES materials(material_id),
-                    institution_id          TEXT NOT NULL,
-                    sha256                  TEXT NOT NULL,
-                    size                    INTEGER NOT NULL,
-                    media_type              TEXT NOT NULL,
-                    version_no              INTEGER NOT NULL,
-                    supersedes_version_id   TEXT,
-                    created_by              TEXT NOT NULL,
-                    created_at              TEXT NOT NULL,
-                    withdrawn               INTEGER NOT NULL DEFAULT 0,
-                    withdrawn_at            TEXT,
-                    UNIQUE(material_id, version_no)
-                );
-
-                CREATE TABLE IF NOT EXISTS packages (
-                    package_id            TEXT PRIMARY KEY,
-                    institution_id        TEXT NOT NULL,
-                    title                 TEXT NOT NULL,
-                    status                TEXT NOT NULL,
-                    created_by            TEXT NOT NULL,
-                    created_at            TEXT NOT NULL,
-                    sealed_at             TEXT,
-                    manifest_fingerprint  TEXT,
-                    decided_at            TEXT,
-                    decision              TEXT,
-                    decision_note         TEXT,
-                    review_fingerprint    TEXT,
-                    supersedes_package_id TEXT
-                );
-
-                CREATE TABLE IF NOT EXISTS entries (
-                    entry_id    TEXT PRIMARY KEY,
-                    package_id  TEXT NOT NULL REFERENCES packages(package_id),
-                    material_id TEXT NOT NULL,
-                    version_id  TEXT NOT NULL REFERENCES versions(version_id),
-                    sha256      TEXT NOT NULL,
-                    kind        TEXT NOT NULL,
-                    sensitivity TEXT NOT NULL,
-                    added_at    TEXT NOT NULL,
-                    UNIQUE(package_id, version_id)
-                );
-
-                CREATE TABLE IF NOT EXISTS requests (
-                    request_id       TEXT PRIMARY KEY,
-                    package_id       TEXT NOT NULL REFERENCES packages(package_id),
-                    institution_id   TEXT NOT NULL,
-                    reviewer_id      TEXT NOT NULL,
-                    status           TEXT NOT NULL,
-                    assigned_by      TEXT NOT NULL,
-                    assigned_at      TEXT NOT NULL,
-                    responded_at     TEXT,
-                    completed_at     TEXT,
-                    verdict          TEXT,
-                    comment          TEXT,
-                    deadline_at_utc  TEXT,
-                    deadline_timezone TEXT
-                );
-                CREATE INDEX IF NOT EXISTS idx_requests_reviewer
-                    ON requests(reviewer_id, status);
-                CREATE INDEX IF NOT EXISTS idx_requests_package ON requests(package_id);
-
-                CREATE TABLE IF NOT EXISTS objections (
-                    objection_id  TEXT PRIMARY KEY,
-                    request_id    TEXT NOT NULL REFERENCES requests(request_id),
-                    package_id    TEXT NOT NULL REFERENCES packages(package_id),
-                    institution_id TEXT NOT NULL,
-                    reviewer_id   TEXT NOT NULL,
-                    category      TEXT NOT NULL,
-                    detail        TEXT NOT NULL,
-                    created_at    TEXT NOT NULL
-                );
-
-                CREATE TABLE IF NOT EXISTS audit_log (
-                    audit_id       TEXT PRIMARY KEY,
-                    package_id     TEXT,
-                    institution_id TEXT,
-                    actor_id       TEXT NOT NULL,
-                    action         TEXT NOT NULL,
-                    at             TEXT NOT NULL,
-                    detail_json    TEXT NOT NULL DEFAULT '{}'
-                );
-
-                CREATE TABLE IF NOT EXISTS idempotency (
-                    idempotency_key TEXT PRIMARY KEY,
-                    result_json     TEXT NOT NULL,
-                    created_at      TEXT NOT NULL
-                );
-
-                CREATE TABLE IF NOT EXISTS api_tokens (
-                    token       TEXT PRIMARY KEY,
-                    user_id     TEXT NOT NULL REFERENCES users(user_id),
-                    created_at  TEXT NOT NULL
-                );
-
-                PRAGMA user_version = 1;
-            """
+            _CONFLICTS_TABLE_SQL + "PRAGMA user_version = 2;"
         )
 
     @contextlib.contextmanager
@@ -626,6 +651,57 @@ class SqliteRepository(Repository):
             for r in rows
         ]
 
+    # ------------------------------------------------- reviewer conflicts
+    def insert_conflict_event(self, event: ConflictEvent) -> None:
+        self._conn.execute(
+            "INSERT INTO reviewer_conflict_events(event_id, package_id,"
+            " institution_id, reviewer_id, event_type, reason, declared_by,"
+            " created_at) VALUES(?,?,?,?,?,?,?,?)",
+            (
+                event.event_id,
+                event.package_id,
+                event.institution_id,
+                event.reviewer_id,
+                event.event_type,
+                event.reason,
+                event.declared_by,
+                event.created_at,
+            ),
+        )
+
+    def list_conflict_events(
+        self, package_id: str, reviewer_id: str | None = None
+    ) -> list[ConflictEvent]:
+        if reviewer_id is None:
+            rows = self._conn.execute(
+                "SELECT * FROM reviewer_conflict_events WHERE package_id = ?"
+                " ORDER BY created_at, rowid",
+                (package_id,),
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                "SELECT * FROM reviewer_conflict_events WHERE package_id = ?"
+                " AND reviewer_id = ? ORDER BY created_at, rowid",
+                (package_id, reviewer_id),
+            ).fetchall()
+        return [_row_to_conflict_event(r) for r in rows]
+
+    def list_active_conflict_package_ids(self, reviewer_id: str) -> list[str]:
+        # 每个 (package_id, reviewer_id) 的最新事件即当前状态；
+        # 事件只追加，rowid 单调，MAX(rowid) 即最新一条；取 declared 最新的包。
+        rows = self._conn.execute(
+            """
+            SELECT package_id FROM reviewer_conflict_events e
+            WHERE reviewer_id = ? AND event_type = 'declared'
+              AND rowid = (
+                  SELECT MAX(rowid) FROM reviewer_conflict_events
+                  WHERE reviewer_id = e.reviewer_id AND package_id = e.package_id
+              )
+            """,
+            (reviewer_id,),
+        ).fetchall()
+        return [r["package_id"] for r in rows]
+
     # ------------------------------------------------------------------ audit
     def insert_audit(self, entry: AuditEntry) -> None:
         self._conn.execute(
@@ -716,4 +792,17 @@ def _row_to_entry(row: sqlite3.Row) -> PackageEntry:
         kind=row["kind"],
         sensitivity=row["sensitivity"],
         added_at=row["added_at"],
+    )
+
+
+def _row_to_conflict_event(row: sqlite3.Row) -> ConflictEvent:
+    return ConflictEvent(
+        event_id=row["event_id"],
+        package_id=row["package_id"],
+        institution_id=row["institution_id"],
+        reviewer_id=row["reviewer_id"],
+        event_type=row["event_type"],
+        reason=row["reason"],
+        declared_by=row["declared_by"],
+        created_at=row["created_at"],
     )

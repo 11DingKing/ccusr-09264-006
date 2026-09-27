@@ -22,6 +22,7 @@ from ..domain.errors import (
     DeadlineExceededError,
     NotFoundError,
     PermissionDeniedError,
+    ReviewerConflictError,
     ValidationError,
 )
 from ..domain.fingerprint import review_record_fingerprint
@@ -67,6 +68,13 @@ class ReviewService(Service):
                 raise ValidationError("被分配人不是评审人", details={"reviewer_id": reviewer_id})
             if reviewer.institution_id == package.institution_id:
                 raise ValidationError("评审人必须独立于送审机构")
+
+            # 分派前拦截：已申报且未解除的利益冲突评审人不可分派
+            if self._is_conflicted(package_id, reviewer_id):
+                raise ReviewerConflictError(
+                    "该评审人对本案件存在已申报的利益冲突，不能分派",
+                    details={"package_id": package_id, "reviewer_id": reviewer_id},
+                )
 
             # 同一评审人已有有效请求：幂等回放
             for req in self.repo.list_requests_by_package(package_id):
@@ -410,6 +418,9 @@ class ReviewService(Service):
             and not self._is_assigned_reviewer(actor, package_id)
         ):
             raise PermissionDeniedError("不能查看该评审包的分配")
+        # 已申报利益冲突的原评审人不能再读取该案件（包括分配情况）
+        if self._is_conflicted(package_id, actor.user_id):
+            raise PermissionDeniedError("该评审人已申报利益冲突，不能读取本案件")
         reqs = self.repo.list_requests_by_package(package_id)
         # 评审人只能看到自己的请求明细；他人存在与否以计数暴露
         if actor.has_role(Role.REVIEWER) and not actor.has_role(
@@ -431,7 +442,17 @@ class ReviewService(Service):
             raise NotFoundError("评审请求不存在")
         if req.reviewer_id != actor.user_id:
             raise PermissionDeniedError("这不是分配给当前评审人的请求")
+        if self._is_conflicted(req.package_id, actor.user_id):
+            raise ReviewerConflictError(
+                "该评审人已对本案件申报利益冲突，不能继续评审操作",
+                details={"request_id": request_id, "package_id": req.package_id},
+            )
         return req
+
+    def _is_conflicted(self, package_id: str, reviewer_id: str) -> bool:
+        return package_id in set(
+            self.repo.list_active_conflict_package_ids(reviewer_id)
+        )
 
     def _check_deadline(self, req: ReviewRequest) -> None:
         if req.deadline_at_utc is None:

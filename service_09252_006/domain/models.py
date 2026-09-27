@@ -128,6 +128,24 @@ class Objection:
 
 
 @dataclass
+class ConflictEvent:
+    """评审人利益冲突事件（追加式，不修改历史行）。
+
+    同一 (package_id, reviewer_id) 的“当前是否冲突”由最新一条事件的
+    event_type 决定：declared 为冲突中，cleared 为已解除。
+    """
+
+    event_id: str
+    package_id: str
+    institution_id: str
+    reviewer_id: str
+    event_type: str               # ConflictEventType
+    reason: str                   # 申报/解除均必须给出理由
+    declared_by: str              # 操作人（秘书处：权威机构或本机构管理员）
+    created_at: str
+
+
+@dataclass
 class Blob:
     sha256: str
     data: bytes

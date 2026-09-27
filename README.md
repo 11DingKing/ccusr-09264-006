@@ -37,6 +37,20 @@
   失权；角色调整在下次请求鉴权时即时生效。
 - 无权限者看到的清单条目不返回摘要（避免内容指纹本身泄露）。
 
+### 评审人利益冲突（分派前核对）
+- 案件分派前由秘书处（质量权威机构或送审机构管理员）登记/核对冲突；
+  `POST /v1/packages/{id}/conflicts` 写入**追加式事件**
+  （`reviewer_conflict_events`，declared/cleared，当前状态由同一
+  评审人+包的最新事件推导，历史行不修改）。
+- 已申报未解除冲突的评审人：Python 分派接口**直接拒绝**
+  （409 `reviewer_conflict`）；申报即刻改变可见范围——包视图、内容下载、
+  分配情况查询一律拒绝，即使此前仍有有效分配；其响应/异议/结论动作同样拦截。
+- 解除冲突是另一条追加事件，解除后方可重新分派、恢复可见。
+- 申报与解除都**必须填写理由**（服务层强制，非仅接口层），理由随事件与
+  审计日志（`review.conflict_declared` / `review.conflict_cleared`）留存；
+  事件流可经 `GET /v1/packages/{id}/conflicts` 核对。
+
+
 ### 并发、幂等与恢复
 - 所有写用例在 `BEGIN IMMEDIATE` 事务内执行；状态推进使用条件 UPDATE
   （`WHERE status = expected`），并发分配/签发下只有一方推进，另一方回放，
@@ -100,6 +114,9 @@ python3 -m service_09252_006.cli verify --db ./data/qe.db [--json]
 | GET  | `/v1/packages/{id}` | 包视图（敏感条目按权限遮蔽） |
 | GET  | `/v1/packages/{id}/entries/{vid}/content` | 授权下载内容字节 |
 | POST | `/v1/packages/{id}/assignments` | 分配评审（可带跨时区截止） |
+| POST | `/v1/packages/{id}/conflicts` | 秘书处申报评审人利益冲突（须理由） |
+| POST | `/v1/packages/{id}/conflicts/clear` | 解除冲突（须理由，追加事件） |
+| GET  | `/v1/packages/{id}/conflicts` | 核对冲突事件流（秘书处/审计） |
 | GET  | `/v1/packages/{id}/requests` | 分配情况 |
 | POST | `/v1/requests/{id}/respond` | 评审人接受/拒绝 |
 | POST | `/v1/requests/{id}/objections` | 登记异议 |

@@ -197,6 +197,114 @@ class HttpApiTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertTrue(body["ok"])
 
+    def test_reviewer_conflict_check_before_assignment(self) -> None:
+        admin = self._create_user(
+            "admin-a", ["institution_admin"], "inst-a", "tok-admin"
+        )
+        authority = self._create_user(
+            "auth", ["quality_authority"], None, "tok-auth"
+        )
+        reviewer = self._create_user(
+            "rev-1", ["reviewer"], "inst-ext", "tok-rev"
+        )
+
+        # 造一个已封存的包
+        import base64
+
+        syllabus = "大纲".encode("utf-8")
+        status, mat = admin.request(
+            "POST", "/v1/materials",
+            {"kind": "syllabus", "title": "大纲"},
+        )
+        self.assertEqual(status, 201)
+        status, ver = admin.request(
+            "POST", f"/v1/materials/{mat['material_id']}/versions",
+            {"content_base64": base64.b64encode(syllabus).decode("ascii")},
+        )
+        self.assertEqual(status, 201)
+        status, pkg = admin.request("POST", "/v1/packages", {"title": "包"})
+        pid = pkg["package_id"]
+        status, _ = admin.request(
+            "POST", f"/v1/packages/{pid}/entries",
+            {"version_id": ver["version_id"]},
+        )
+        self.assertEqual(status, 201)
+        status, _ = admin.request("POST", f"/v1/packages/{pid}/seal", {})
+        self.assertEqual(status, 200)
+
+        # 无理由申报被拒（422）
+        status, body = authority.request(
+            "POST", f"/v1/packages/{pid}/conflicts",
+            {"reviewer_id": "rev-1", "reason": "   "},
+        )
+        self.assertEqual(status, 422)
+        self.assertEqual(body["error"]["code"], "validation_error")
+
+        # 秘书处带理由申报冲突
+        status, event = authority.request(
+            "POST", f"/v1/packages/{pid}/conflicts",
+            {"reviewer_id": "rev-1", "reason": "近三年在送审机构兼职"},
+            idempotency_key="conflict-1",
+        )
+        self.assertEqual(status, 201)
+        self.assertEqual(event["event_type"], "declared")
+        self.assertEqual(event["reason"], "近三年在送审机构兼职")
+        # 幂等重放
+        status, replay = authority.request(
+            "POST", f"/v1/packages/{pid}/conflicts",
+            {"reviewer_id": "rev-1", "reason": "近三年在送审机构兼职"},
+            idempotency_key="conflict-1",
+        )
+        self.assertEqual(status, 201)
+        self.assertEqual(replay["event_id"], event["event_id"])
+        self.assertTrue(replay["replayed"])
+
+        # 分派冲突评审人被拒（409 reviewer_conflict）
+        status, body = authority.request(
+            "POST", f"/v1/packages/{pid}/assignments",
+            {"reviewer_id": "rev-1"},
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(body["error"]["code"], "reviewer_conflict")
+
+        # 申报后原评审人不能再读取该案件
+        status, body = reviewer.request("GET", f"/v1/packages/{pid}")
+        self.assertEqual(status, 403)
+
+        # 解除冲突同样必须留理由
+        status, body = authority.request(
+            "POST", f"/v1/packages/{pid}/conflicts/clear",
+            {"reviewer_id": "rev-1", "reason": ""},
+        )
+        self.assertEqual(status, 422)
+        status, cleared = authority.request(
+            "POST", f"/v1/packages/{pid}/conflicts/clear",
+            {"reviewer_id": "rev-1", "reason": "兼职关系已结束并经秘书处复核"},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(cleared["event_type"], "cleared")
+
+        # 解除后可以分派
+        status, req = authority.request(
+            "POST", f"/v1/packages/{pid}/assignments",
+            {"reviewer_id": "rev-1"},
+        )
+        self.assertEqual(status, 201)
+
+        # 冲突事件可核对，理由都留存在记录中
+        status, listing = authority.request(
+            "GET", f"/v1/packages/{pid}/conflicts"
+        )
+        self.assertEqual(status, 200)
+        kinds = [(c["event_type"], c["reason"]) for c in listing["conflicts"]]
+        self.assertEqual(
+            kinds,
+            [
+                ("declared", "近三年在送审机构兼职"),
+                ("cleared", "兼职关系已结束并经秘书处复核"),
+            ],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

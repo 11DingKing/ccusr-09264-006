@@ -6,7 +6,9 @@
   质量权威机构、审计可见；本机构普通提交人不可见；
 - 任何外机构用户一律不可见（审计除外，审计可跨机构只读）；
 - 评审人若其请求已被取消（重新分配给他人），从取消时刻起失去该包
-  敏感材料的访问权（权限变化即时生效）。
+  敏感材料的访问权（权限变化即时生效）；
+- 评审人一旦对某包申报了利益冲突（且未解除），对该包全部条目即刻
+  失权——冲突案件对原评审人整体不可读，而不只是敏感条目。
 """
 from __future__ import annotations
 
@@ -15,11 +17,14 @@ from .models import PackageEntry, ReviewPackage, User
 
 
 class DisclosureContext:
-    """一次访问的权限上下文：用户当前有效的评审分配。
+    """一次访问的权限上下文：用户当前有效的评审分配与利益冲突集合。
 
     active_request_package_ids: 该用户作为评审人、状态仍为
     pending/accepted/completed（即未 cancelled/declined）的请求所在包。
     declined 也不应保留访问权——评审人拒绝后即与该包无关。
+
+    conflicted_package_ids: 该用户作为评审人已申报且未解除利益冲突的包。
+    冲突包对该评审人整体不可见（优先于“仍有效分配”的放行）。
     """
 
     ACTIVE_STATUSES = frozenset(
@@ -30,9 +35,15 @@ class DisclosureContext:
         }
     )
 
-    def __init__(self, user: User, active_request_package_ids: set[str]) -> None:
+    def __init__(
+        self,
+        user: User,
+        active_request_package_ids: set[str],
+        conflicted_package_ids: set[str] | None = None,
+    ) -> None:
         self.user = user
         self.active_package_ids = active_request_package_ids
+        self.conflicted_package_ids = conflicted_package_ids or set()
 
     def can_see_entry(
         self,
@@ -63,6 +74,9 @@ class DisclosureContext:
 
         # 跨机构：只有“仍被有效分配到该包”的评审人可见
         if user.has_role(Role.REVIEWER):
+            # 已申报利益冲突的包对该评审人整体失权（即使请求仍有效）
+            if entry.package_id in self.conflicted_package_ids:
+                return False
             return entry.package_id in self.active_package_ids
         return False
 
